@@ -1,0 +1,376 @@
+---
+title: 'Extracting component effects from network meta analysis: Power and bias'
+output:
+  html_document:
+    df_print: paged
+---
+
+
+The goal here is to sketch out how we might simulate data for a network meta analysis, and then run a power analysis for variables of interest: for example, like the N studies included in the network, and also the number and overlap of components.
+
+
+# Setup
+
+
+```{r, echo=T, include=F}
+library(broom)
+library(tidyverse)
+library(broom)
+library(brms)
+library(rstanarm)
+library(tidybayes)
+options(mc.cores = parallel::detectCores()-1)
+
+```
+
+
+
+
+
+# Defining the population of studies
+
+For the moment, we assume components of treatment A-Z, which are variously combined and then compared against a single control intervention:
+
+
+## Intervention component effect sizes.
+
+```{r}
+set.seed(12345)
+
+# these are the population effect sizes for each intervention
+# nb Only A has an effect for the moment
+txEffs <-  c(.5, .25, rep(0, length(LETTERS)-2)) #rnorm(length(LETTERS), .5, .5)
+names(txEffs) <- LETTERS
+
+population_treatment_modifier_mean = 0
+population_treatment_modifier_sd = 0
+```
+
+
+Combinations of components:
+
+```{r}
+maxtx <- 3
+maxctrl <- 1
+
+txcombinations <- purrr::map(combn(c(names(txEffs[1:maxtx]), rep(NA, maxtx)), m=maxtx, simplify = F), .f = sort) %>% 
+  map(~paste0(., collapse = "")) %>% as_vector() %>% .[.!=""] %>% unique
+
+# could vary this later
+ctrlcombinations = "Z"
+
+txcombinations
+ctrlcombinations
+````
+
+
+
+```{r, include=F, echo=T}
+# helper to lookup effect size for intervention of specific name
+lookupd <- function(txcombination, effects=txEffs) {
+  effects[str_split(txcombination, "")[[1]]] %>% sum()
+}
+
+# another helper to create dummy codings for variables
+contains.tx <- function(txcombination, effects = txEffs){
+  x <- str_locate(txcombination,  names(txEffs)) %>% 
+    as.tibble() %>% transmute(x=!is.na(start), tx = paste0("tx",names(txEffs))) %>% 
+    mutate(n=1) %>% 
+    data.table::dcast(n~tx, value.var="x") %>% select(-n) 
+  x
+}
+```
+
+
+This makes the full list of comparisons:
+
+```{r}
+network.comparisons_ <- crossing(   tx = txcombinations,
+                            ctrl = ctrlcombinations) %>% 
+  mutate(comparison = factor(paste(tx, "vs", ctrl))) %>% 
+  rowwise() %>% 
+  mutate(tx_d = lookupd(tx)) %>% 
+  mutate(ctrl_d = lookupd(ctrl)) %>% 
+  mutate(d = tx_d - ctrl_d)  %>% 
+  ungroup() 
+
+txdummies  <- network.comparisons_ %>% 
+  distinct(tx) %>% 
+  group_by(tx) %>% 
+  do(., contains.tx(.$tx)) 
+
+network.comparisons <- left_join(network.comparisons_, txdummies[,1:4]) %>% 
+  glimpse
+```
+
+
+
+# Make population of studies which is later sampled-from for the meta analysis
+
+```{r}
+NSTUDIES <- 100 # per comparison... this is alots
+NPERSTUDY <- 1000 # max N individuals within a study
+
+network.studies <- network.comparisons %>% 
+  group_by(comparison) %>% 
+  do(., sample_n(., NSTUDIES, replace=T)) %>% 
+  ungroup() %>% 
+  mutate(study=row_number())
+
+network.ipd <- network.studies %>%
+  tidyr::expand(select(., everything()), participant = 0:NPERSTUDY, treated = 0:1) %>% 
+  group_by(study, treated) %>% 
+  mutate(y = rnorm(n(), d*treated, 1)) %>% 
+  glimpse
+```
+
+
+Check the effects look right
+
+
+
+```{r}
+network.ipd %>% 
+  ggplot(aes(factor(treated), y, group=comparison)) + 
+  stat_summary(fun.data = mean_cl_normal, geom="line") + 
+  stat_summary(fun.data = mean_cl_normal, geom="pointrange") + 
+  geom_hline(yintercept = c(0,.5), linetype="dotted") + facet_wrap(~comparison)
+```
+
+
+
+
+
+# Sample from the population of studies
+
+That is, sample both studies and individuals within studies (to simulate that studies vary in size)
+
+
+```{r}
+#set.seed(12345)
+# let's say we found 20 or 100 published studies
+N_STUDY_SAMPLED <- 100
+
+# see below... study size is cauchy distributed, which may not be sensible, but it's not normal
+ARM_N_MEAN <- 80
+network.ipd$study %>% unique %>% length
+# N_COMPARISONS <- network.comparisons$tx %>% unique %>% length
+# MISSING_COMPARISONS <- c("A", "C") # both against Z
+studysubset <- sample(network.ipd$study %>% unique, size=N_STUDY_SAMPLED, replace=F) 
+
+# hist(rcauchy(30, location = 100, scale = 15) %>% .[.>20])
+network.ipd.sample <- network.ipd %>% 
+  filter(study %in% studysubset) %>% 
+  group_by(study) %>% 
+  do(., top_n(., n=min(1000, max(20, round(rcauchy(1, 100, 20), 0))), wt=runif(n())) ) %>% 
+  ungroup() %>%
+  glimpse
+
+network.ipd.sample %>% 
+  group_by(study, treated) %>% 
+  summarise(n=n()) %>% 
+  glimpse
+```
+
+
+
+
+
+
+
+
+# IPD meta analysis
+
+First, run simple `lm` within each study to calculate summary data (i.e. between groups diff and std error)
+
+```{r}
+network.ipd.sample.summary <- network.ipd.sample %>% 
+  group_by(study) %>% 
+  do(., {lm(y~treated, data=.) %>% tidy() %>% filter(term=="treated")}) %>% 
+  select(study, estimate, std.error) %>% 
+  glimpse
+```
+
+
+
+Forest-type plot
+```{r}
+left_join(network.ipd.sample.summary, network.studies %>% select(study, tx)) %>% 
+  ggplot(aes(tx, y=estimate, color=tx,
+             ymin=estimate-std.error, ymax=estimate+std.error )) + 
+  geom_pointrange(position="jitter") +
+  geom_hline(yintercept = c(0,.25,.5), linetype="dotted") + coord_flip()
+```
+
+
+
+
+
+## Fitting an PD model
+
+```{r}
+ipd.lmer <- m1 <- stan_lmer(y ~ 0+treated*tx + (1|study), data=network.ipd.sample) 
+ipd.lmer 
+```
+
+## Simulating 
+
+```{r}
+nd <- network.comparisons %>% 
+  filter(tx=="A"|tx=="B"|tx=="C") %>% 
+  select(tx, txA,txB,txC) %>% 
+  tidyr::expand(select(., everything()), treated=0:1) %>% mutate(study=Inf)
+
+
+a.b.c.diffs <- tidybayes::add_fitted_samples(nd, ipd.lmer) %>% 
+  data.table::dcast(.iteration+tx~treated, value.var="estimate") %>% 
+  mutate(d = `0`-`1`) %>% 
+  data.table::dcast(.iteration~tx, value.var="d") %>% 
+  mutate(AB = A-B, AC = A-C, BC = B-C) %>% 
+  glimpse
+```
+
+
+## True tx effects:
+
+Differences should be AC = .5, AB or BC = .25
+
+```{r}
+network.comparisons %>% 
+  filter(tx=="A"|tx=="B"|tx=="C") %>% 
+  select(tx, tx_d)
+```
+
+
+## Recovered individual treatment comparisons
+
+
+```{r}
+a.b.c.diffs %>% 
+  select(AB, AC, BC) %>% 
+  data.table::melt() %>% 
+  ggplot(aes(value, color=variable)) + 
+  geom_density() + 
+  geom_vline(xintercept = c(-.25,-.5), linetype="dotted")
+```
+
+
+In tabular form
+
+```{r}
+a.b.c.diffs %>% 
+  select(AB, AC, BC) %>% 
+  data.table::melt() %>% 
+  group_by(variable) %>% 
+  tidybayes::median_qi(value)
+```
+
+Need to check this..
+
+```{r}
+a.b.c.diffs %>% 
+  select(AB, AC, BC) %>% 
+  brms::hypothesis(c("AB > BC", "AC < AB"))
+```
+
+
+
+## Ranked treatments
+
+```{r}
+tx.rankings <- tidybayes::add_fitted_samples(nd, ipd.lmer) %>% 
+  data.table::dcast(.iteration+tx~treated, value.var="estimate") %>% 
+  mutate(d = `0`-`1`) %>% 
+  group_by(.iteration) %>% 
+  arrange(-d) %>% 
+  mutate(r = row_number()) %>% 
+  group_by(.iteration) %>% 
+  summarise(rank = paste(tx, collapse="<"))
+  
+tx.rankings %>% group_by(rank) %>% count() %>% mutate(percent=n/4000 * 100)
+  
+```
+
+
+
+
+
+
+# From summary data
+
+```{r}
+# don't need this here, but would with real data
+ctrl.sd <- network.ipd %>% filter(treated==0) %>% pull(y) %>% sd(.)
+
+network.ipd.sample.summary.z <- network.ipd.sample.summary %>% 
+  mutate(estimate = estimate/ctrl.sd)
+
+mreg.data <- network.ipd.sample.summary.z %>% 
+  left_join(network.studies %>% select(study, starts_with("tx")))
+```
+
+
+## Random effects model
+
+i.e. random effect between studies
+
+```{r}
+#meta.fixed <- brm(estimate | se(std.error) ~ 1, data = mreg.data)
+#meta.random <- brm(estimate | se(std.error) ~ 1 + (1|study), data = mreg.data)
+metareg.random <- brm(estimate | se(std.error) ~ 0 + tx + (1|study), data = mreg.data)
+
+```
+
+
+Individual effects of A vs B vs C are reasonably well extracted... although B !=.25 and this was a large sample, so perhaps need to check in sims:
+
+```{r}
+metareg.random
+```
+
+
+
+# Next steps...
+
+
+Simulation which:
+
+- reduces the (study) sample size
+- makes study size distribution more realistic ... cauchy? t?
+- varies population severity/responsiveness
+- eliminates network paths or independent evaluations and uses the equivalence equations (see welton paper)
+- imagines more components in the network, with more overlap (and fewer individual evaluations)
+- uses active interventions as controls
+- varies control effectiveness
+- introduces confounding... e.g. association between treatments and control effectiveness
+- samples from heterogenous effect sizes... i.e. situation when theta not fixed across studies
+
+
+
+In terms of models:
+
+- Think more about model priors 
+- parameterisation? Are we equivalent to the common BUGS models?
+
+
+
+
+Won't do
+
+- binary outcomes; stick with continuous?
+- twice-removed comparisons? I.e. distant comparisons in a large network
+
+
+
+
+When writing simulation
+
+- Setup simple script to run model from command line params, save the compressed chains only by-filename
+- Check mc.cores on linux cluster
+- separate script to read chains RDS files and summarise/crunch
+
+
+
+
+
+
